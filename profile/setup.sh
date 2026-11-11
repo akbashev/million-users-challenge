@@ -10,11 +10,14 @@ ip netns exec bench sysctl -q -w net.ipv4.ip_local_port_range="1024 65535" net.c
   net.ipv4.tcp_max_syn_backlog=65535 net.ipv4.tcp_tw_reuse=1
 sysctl -q -w fs.nr_open=8388608
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq postgresql-common jq tcpdump linux-tools-common "linux-tools-$(uname -r)" > /dev/null \
-  || apt-get install -y -qq postgresql-common jq tcpdump linux-tools-generic > /dev/null
-/usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y > /dev/null
-apt-get install -y -qq postgresql-18 > /dev/null
+# The runners' DNS fails now and then ("Temporary failure resolving"): every apt step is tried for about five minutes,
+# and an update that couldn't fetch an index counts as failed (Error-Mode=any).
+retry() { for i in $(seq 10); do "$@" && return 0; echo "attempt $i of: $* failed; again in 30 s"; sleep 30; done; return 1; }
+retry apt-get update -qq -o APT::Update::Error-Mode=any
+retry apt-get install -y -qq postgresql-common jq tcpdump linux-tools-common "linux-tools-$(uname -r)" > /dev/null \
+  || retry apt-get install -y -qq postgresql-common jq tcpdump linux-tools-generic > /dev/null
+retry /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y > /dev/null
+retry apt-get install -y -qq postgresql-18 > /dev/null
 CONF=/etc/postgresql/18/main
 sed -e 's/^shared_buffers.*/shared_buffers = 2GB/' -e 's/^effective_cache_size.*/effective_cache_size = 6GB/' \
     -e 's/^maintenance_work_mem.*/maintenance_work_mem = 512MB/' -e 's/^max_wal_size.*/max_wal_size = 4GB/' \
