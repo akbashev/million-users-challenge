@@ -41,7 +41,10 @@ jobs:
           for e in $order; do sudo bash profile/run.sh $e $e-${{ matrix.run }} 100000 0.7 30 150; done
       - name: summary
         if: always()
-        run: cat profile/out/*/summary.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+        run: |
+          # The runs write as root, perf.data readable by root alone: the upload runs as the runner user.
+          sudo chmod -R a+rX profile/out 2>/dev/null || true
+          cat profile/out/*/summary.txt >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: 'profile-${{ matrix.run }}', path: profile/out, retention-days: 7 }
