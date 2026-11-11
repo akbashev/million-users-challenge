@@ -3,15 +3,23 @@
 # Postgres 18 (installed, configured later by rig.sh), and the user `challenge` the entries build as.
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-for h in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com github.com apt.postgresql.org download.swift.org \
-         builds.dotnet.microsoft.com sqlite.org; do
-  echo "dns $h: $(getent hosts $h > /dev/null && echo ok || echo FAILS)"
-done
-# The runners' apt mirror list names only azure.archive.ubuntu.com, which didn't resolve on 2026-11-11 while other
-# names did: the main archive instead when it doesn't (the entries' install.sh use the same list).
-if ! getent hosts azure.archive.ubuntu.com > /dev/null && [ -f /etc/apt/apt-mirrors.txt ]; then
-  echo "using archive.ubuntu.com"; echo "http://archive.ubuntu.com/ubuntu/" > /etc/apt/apt-mirrors.txt
+lookups() {
+  for h in azure.archive.ubuntu.com archive.ubuntu.com github.com apt.postgresql.org download.swift.org \
+           builds.dotnet.microsoft.com sqlite.org; do
+    echo "dns $h: $(timeout 5 getent hosts $h > /dev/null && echo ok || echo FAILS)"
+  done
+}
+# On 2026-11-11 one of Canonical's three nameservers stopped answering, and the runners' resolver (like Google's) then
+# failed every *.ubuntu.com name while Cloudflare's answered: the runner asks Cloudflare when Ubuntu's mirror doesn't
+# resolve.
+if ! timeout 5 getent hosts azure.archive.ubuntu.com > /dev/null; then
+  echo "azure.archive.ubuntu.com doesn't resolve: asking 1.1.1.1"
+  mkdir -p /etc/systemd/resolved.conf.d
+  printf '[Resolve]\nDNS=1.1.1.1 1.0.0.1\nDomains=~.\n' > /etc/systemd/resolved.conf.d/cloudflare.conf
+  systemctl restart systemd-resolved
+  sleep 2
 fi
+lookups
 # An update that couldn't fetch an index counts as failed (Error-Mode=any); each apt step is tried four times.
 retry() { for i in 1 2 3 4; do "$@" && return 0; echo "attempt $i of: $* failed; again in 30 s"; sleep 30; done; return 1; }
 retry apt-get update -qq -o APT::Update::Error-Mode=any
