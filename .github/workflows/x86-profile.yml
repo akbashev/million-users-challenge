@@ -1,5 +1,5 @@
-# Not for upstream: swift-iouring-akbashev (#112) sending through its ring, against #112 as it is and against
-# fsharp-kestrel-uring-delneg, on one runner: the server on CPU 0, Postgres on CPU 1, mload on CPUs 2-3, all in one
+# Not for upstream: swift-iouring-akbashev (#112) with its state a value its loop owns (d6ccc88), against #112 at
+# 03d0113 and fsharp-kestrel-uring-delneg, on one runner: the server on CPU 0, Postgres on CPU 1, mload on CPUs 2-3, all in one
 # network namespace. CPU per request (user, sys), system calls and io_uring operations per request, packets per request,
 # p95/p99, a perf profile. Two jobs, rotating order.
 name: x86 profile
@@ -32,7 +32,7 @@ jobs:
         run: sudo bash profile/entries.sh swift-iouring-akbashev swift-iouring-akbashev-old fsharp-kestrel-uring-delneg
       - name: rig (namespace, Postgres 18, seed)
         run: sudo bash profile/rig.sh
-      - name: tests (#112 sending through the ring)
+      - name: tests (#112, state owned by its loop)
         run: sudo bash profile/test.sh swift-iouring-akbashev
       - name: runs (100,000 users, -gzip, think 0.7)
         run: |
