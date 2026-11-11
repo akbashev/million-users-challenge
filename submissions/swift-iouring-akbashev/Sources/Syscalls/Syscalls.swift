@@ -15,16 +15,16 @@ import Glibc
 @_extern(c, "listen") public func sys_listen(_ fd: Int32, _ backlog: Int32) -> Int32
 @_extern(c, "accept4") public func sys_accept4(_ fd: Int32, _ addr: UnsafeMutableRawPointer?, _ len: UnsafeMutableRawPointer?, _ flags: Int32) -> Int32
 @_extern(c, "epoll_create1") public func sys_epoll_create1(_ flags: Int32) -> Int32
-@_extern(c, "epoll_ctl") public func sys_epoll_ctl(_ epfd: Int32, _ op: Int32, _ fd: Int32, _ event: UnsafeMutableRawPointer) -> Int32
-@_extern(c, "epoll_wait") public func sys_epoll_wait(_ epfd: Int32, _ events: UnsafeMutableRawPointer, _ maxEvents: Int32, _ timeout: Int32) -> Int32
+@_extern(c, "epoll_ctl") public func sys_epoll_ctl(_ epfd: Int32, _ op: Int32, _ fd: Int32, _ event: UnsafeMutableRawPointer?) -> Int32
+@_extern(c, "epoll_wait") public func sys_epoll_wait(_ epfd: Int32, _ events: UnsafeMutableRawPointer?, _ maxEvents: Int32, _ timeout: Int32) -> Int32
 @_extern(c, "read") public func sys_read(_ fd: Int32, _ buf: UnsafeMutableRawPointer?, _ count: Int) -> Int
 @_extern(c, "write") public func sys_write(_ fd: Int32, _ buf: UnsafeRawPointer?, _ count: Int) -> Int
 @_extern(c, "writev") public func sys_writev(_ fd: Int32, _ iov: UnsafeRawPointer, _ iovcnt: Int32) -> Int
 @_extern(c, "close") public func sys_close(_ fd: Int32) -> Int32
 @_extern(c, "shutdown") public func sys_shutdown(_ fd: Int32, _ how: Int32) -> Int32
 @_extern(c, "pthread_setname_np") public func sys_pthread_setname_np(_ thread: pthread_t, _ name: UnsafePointer<CChar>) -> Int32
-@_extern(c, "sched_getaffinity") public func sys_sched_getaffinity(_ pid: Int32, _ size: Int, _ mask: UnsafeMutableRawPointer) -> Int32
-@_extern(c, "getrandom") public func sys_getrandom(_ buf: UnsafeMutableRawPointer, _ len: Int, _ flags: UInt32) -> Int
+@_extern(c, "sched_getaffinity") public func sys_sched_getaffinity(_ pid: Int32, _ size: Int, _ mask: UnsafeMutableRawPointer?) -> Int32
+@_extern(c, "getrandom") public func sys_getrandom(_ buf: UnsafeMutableRawPointer?, _ len: Int, _ flags: UInt32) -> Int
 
 #if arch(x86_64)
 /// glibc's x86 feature table (<sys/platform/x86.h>, glibc 2.33+): for CPUID leaf `index`, eight words, the four

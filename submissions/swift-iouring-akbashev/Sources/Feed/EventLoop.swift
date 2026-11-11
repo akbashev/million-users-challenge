@@ -34,7 +34,7 @@ final class EventLoop: SerialExecutor, TaskExecutor {
         withUnsafeTemporaryAllocation(byteCount: 16, alignment: 8) { raw in
             raw.storeBytes(of: events, toByteOffset: 0, as: UInt32.self)
             raw.storeBytes(of: token, toByteOffset: Sys.epollDataOffset, as: UInt64.self)
-            return sys_epoll_ctl(epfd, op, fd, raw.baseAddress!)
+            return sys_epoll_ctl(epfd, op, fd, raw.baseAddress)
         }
     }
 
@@ -105,7 +105,7 @@ final class EventLoop: SerialExecutor, TaskExecutor {
     /// epoll_wait into `events`, as many events as it holds.
     @inline(__always) private func epollWait(_ events: inout [UInt8], _ timeout: Int32) -> Int32 {
         let capacity = Int32(events.count / Sys.epollEventStride)
-        return events.withUnsafeMutableBytes { sys_epoll_wait(epollFD, $0.baseAddress!, capacity, timeout) }
+        return events.withUnsafeMutableBytes { sys_epoll_wait(epollFD, $0.baseAddress, capacity, timeout) }
     }
 
     // ---------- the thread ----------

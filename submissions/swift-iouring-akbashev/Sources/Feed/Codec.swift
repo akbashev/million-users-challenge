@@ -10,8 +10,8 @@ enum Bytes {
         let end = end ?? hay.count
         guard from < end else { return nil }
         return hay.withUnsafeBufferPointer { buf -> Int? in
-            guard let hit = memchr(buf.baseAddress! + from, Int32(needle), end - from) else { return nil }
-            return UnsafeRawPointer(buf.baseAddress!).distance(to: UnsafeRawPointer(hit))
+            guard let base = buf.baseAddress, let hit = memchr(base + from, Int32(needle), end - from) else { return nil }
+            return UnsafeRawPointer(base).distance(to: UnsafeRawPointer(hit))
         }
     }
 
@@ -31,7 +31,7 @@ enum Bytes {
     static func fillRandom(_ dst: UnsafeMutableRawBufferPointer) -> Bool {
         var done = 0
         while done < dst.count {
-            let n = sys_getrandom(dst.baseAddress! + done, dst.count - done, 0)
+            let n = sys_getrandom(UnsafeMutableRawBufferPointer(rebasing: dst[done...]).baseAddress, dst.count - done, 0)
             if n < 0 {
                 if errno == Sys.EINTR { continue }
                 return false
@@ -62,7 +62,9 @@ enum Bytes {
 
     /// memcmp of `n` bytes, where a pointer may be nil only if `n` is 0.
     @inline(__always) static func compare(_ a: UnsafeRawPointer?, _ b: UnsafeRawPointer?, _ n: Int) -> Int32 {
-        n == 0 ? 0 : memcmp(a!, b!, n)
+        guard n > 0 else { return 0 }
+        guard let a, let b else { preconditionFailure("memcmp of \(n) bytes without a pointer") }
+        return memcmp(a, b, n)
     }
 
     @inline(__always) static func equal(_ a: borrowing [UInt8], _ b: StaticString) -> Bool {
@@ -549,7 +551,23 @@ extension JSON {
                     code = 0x10000 + ((code - 0xD800) << 10) + (UInt32(hex4(text, i + 2)) - 0xDC00)
                     i += 6
                 }
-                for byte in UTF8.encode(Unicode.Scalar(code)!)! { out.append(byte) }
+                // A scalar: the validating pass let through no lone surrogate.
+                switch code {
+                case ..<0x80:
+                    out.append(UInt8(code))
+                case ..<0x800:
+                    out.append(UInt8(0xC0 | code >> 6))
+                    out.append(UInt8(0x80 | code & 0x3F))
+                case ..<0x10000:
+                    out.append(UInt8(0xE0 | code >> 12))
+                    out.append(UInt8(0x80 | code >> 6 & 0x3F))
+                    out.append(UInt8(0x80 | code & 0x3F))
+                default:
+                    out.append(UInt8(0xF0 | code >> 18))
+                    out.append(UInt8(0x80 | code >> 12 & 0x3F))
+                    out.append(UInt8(0x80 | code >> 6 & 0x3F))
+                    out.append(UInt8(0x80 | code & 0x3F))
+                }
             default: out.append(e)
             }
         }
@@ -565,10 +583,13 @@ extension JSON {
         }
     }
 
-    /// Four hex digits at `at` (already checked).
+    /// Four hex digits at `at`, already checked: a digit's low four bits, plus 9 for a letter (either case).
     @inline(__always) private static func hex4(_ text: Span<UInt8>, _ at: Int) -> UInt16 {
         var value: UInt16 = 0
-        for k in 0..<4 { value = value << 4 | hexValue(text[at + k])! }
+        for k in 0..<4 {
+            let b = text[at + k]
+            value = value << 4 | (UInt16(b & 0x0F) &+ (b > 0x39 ? 9 : 0))
+        }
         return value
     }
 

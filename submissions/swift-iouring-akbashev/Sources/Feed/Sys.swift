@@ -77,7 +77,7 @@ extension Sys {
     static func availableParallelism() -> Int {
         var mask = InlineArray<16, UInt64>(repeating: 0)
         var span = mask.mutableSpan
-        let rc = span.withUnsafeMutableBytes { sys_sched_getaffinity(0, $0.count, $0.baseAddress!) }
+        let rc = span.withUnsafeMutableBytes { sys_sched_getaffinity(0, $0.count, $0.baseAddress) }
         guard rc == 0 else { return max(Int(sysconf(Int32(_SC_NPROCESSORS_ONLN))), 1) }
         var cpus = 0
         for i in 0..<16 { cpus += mask[i].nonzeroBitCount }
@@ -161,7 +161,7 @@ extension Sys {
     static func writeAll(_ fd: Int32, _ bytes: UnsafeRawBufferPointer) throws(SystemError) {
         var off = 0
         while off < bytes.count {
-            let n = sys_write(fd, bytes.baseAddress! + off, bytes.count - off)
+            let n = sys_write(fd, UnsafeRawBufferPointer(rebasing: bytes[off...]).baseAddress, bytes.count - off)
             if n < 0 {
                 if errno == EINTR { continue }
                 throw SystemError("write")
@@ -202,7 +202,8 @@ extension Sys {
         let start = Unmanaged.passRetained(ThreadStart(name: name, body: body)).toOpaque()
         var thread = pthread_t()
         let rc = pthread_create(&thread, nil, { raw in
-            let start = Unmanaged<ThreadStart>.fromOpaque(raw!).takeRetainedValue()
+            guard let raw else { return nil }
+            let start = Unmanaged<ThreadStart>.fromOpaque(raw).takeRetainedValue()
             _ = sys_pthread_setname_np(pthread_self(), String(start.name.prefix(15)))
             start.body()
             return nil
