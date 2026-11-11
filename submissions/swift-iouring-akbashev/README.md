@@ -21,6 +21,9 @@ own: about 0.03 system calls per request, one `io_uring_enter` per turn.
   with a child task per reactor. Each reactor owns its listeners (an `SO_REUSEPORT` socket on each of the two ports),
   its client connections, a file descriptor table of its own (`unshare(CLONE_FILES)`) and its Postgres connections.
   Nothing crosses between threads on the way from a request to its response, and nothing is `@unchecked Sendable`.
+  The actor is the thread; what a request touches (the ring, listeners, connection slots, Postgres pipelines,
+  buffers) is a noncopyable `State` value that the reactor's loop makes on that thread and owns, so there is no
+  reactor state without a ring and none of it is reachable from outside the loop.
 - **A ring per reactor.** Made on the reactor's own thread (`SINGLE_ISSUER`, `DEFER_TASKRUN`, `COOP_TASKRUN`): a
   multishot accept on each listener, and one multishot receive per connection into the ring's provided buffers
   (8,192 of 2 KB per reactor): a buffer is taken only when bytes arrive, the request is parsed in place and the buffer

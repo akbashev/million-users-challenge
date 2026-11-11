@@ -1,12 +1,12 @@
-// A reactor: one per core, an actor on its own event loop that owns everything a request touches. It accepts on its own
-// SO_REUSEPORT listeners on both ports into a file descriptor table of its own, and drives its own Postgres
-// connections from the same io_uring, so nothing crosses between threads on the way from a request to its response.
-// Each turn it takes the completions off its ring: a multishot accept per listener, a multishot receive per connection
-// into the ring's provided buffers (an idle connection holds none), polls for the Postgres sockets; requests are
-// parsed and routed, Postgres replies turned into responses, and responses sent through the ring (one send in flight per
-// connection, what follows queued behind it). At the end of the turn the turn's reads go out under one Sync on one read
-// connection, and its writes under one Sync on one write connection: one transaction and one commit for them; then the
-// turn's sends go to the kernel, all with one enter.
+// A reactor: one per core, an actor whose executor is its own event loop, and a `State` value its loop owns with
+// everything a request touches. It accepts on its own SO_REUSEPORT listeners on both ports into a file descriptor table
+// of its own, and drives its own Postgres connections from the same io_uring, so nothing crosses between threads on the
+// way from a request to its response. Each turn it takes the completions off its ring: a multishot accept per listener,
+// a multishot receive per connection into the ring's provided buffers (an idle connection holds none), receives and
+// sends of the Postgres connections; requests are parsed and routed, Postgres replies turned into responses, and
+// responses sent through the ring (one send in flight per connection, what follows queued behind it). At the end of the
+// turn the turn's reads go out under one Sync on one read connection, and its writes under one Sync on one write
+// connection: one transaction and one commit for them; then the turn's sends go to the kernel, all with one enter.
 import Glibc
 import Gzip
 import IORing
@@ -15,618 +15,667 @@ import Syscalls
 actor Reactor {
     nonisolated let loop: EventLoop
     nonisolated var unownedExecutor: UnownedSerialExecutor { loop.asUnownedSerialExecutor() }
-
-    private let signer: TokenSigner
-    private let db: DbEndpoint
-    private let host: String
-    private let ports: [UInt16]
-    private let readConnections: Int
-    private let started: UInt64
-    private let pause: Pause
-
-    /// The listening sockets, one per port.
-    private var listeners: [Int32] = []
-    private var slots = UniqueArray<ClientSlot>(capacity: 4096)
-    private var freeSlots: [UInt32] = []
-    /// Error bodies are written here, and sent from here.
-    private var errorBody = ByteBuffer(capacity: 256)
-    /// Bodies of at least `gzipMinimum` bytes go out compressed to a client that accepts gzip: the feed, 5 KB to about 2.
-    private var gzip = Gzip()
-    private var gzipped = ByteBuffer(capacity: 16 * 1024)
-    private var pipelinedSlots: [UInt32] = []
-    /// A turn that took this many completions goes straight on to the next (see `run`).
-    private let maxEvents = 1024
-    /// This reactor's ring, made on its own thread in `run`: one issuer, and completions posted only when it asks
-    /// (SINGLE_ISSUER, DEFER_TASKRUN).
-    private var ring: IORing?
-    /// The provided buffers multishot receives fill: a buffer is taken when bytes arrive and given back once parsed.
-    private var bufferGroup: UInt16 = 0
-    private let bufferCount: Int
-    private let bufferSize: Int
-    /// The eventfd's 8 bytes, where the wake read lands.
-    private let wakeBytes = UnsafeMutableRawBufferPointer.allocate(byteCount: 8, alignment: 8)
-    /// Connections whose multishot receive ended for want of a buffer: armed again once the turn gave its back.
-    private var starved: [(slot: UInt32, epoch: UInt32)] = []
-    /// Each pipeline's connection, counted, in its requests' tokens: a lost connection's late completions are told
-    /// apart.
-    private var pipeGenerations: [UInt32]
-
-    /// The Postgres connections: `readConnections` for reads, then the write connections.
-    private var pipes = UniqueArray<Pipeline>()
-    /// The read connection this turn's reads go to, chosen at its first read.
-    private var turnReads: Int?
-    /// The write connection this turn's writes go to, chosen at its first write.
-    private var turnWrites: Int?
-    /// Pipelines with messages queued this turn (a bit each).
-    private var queued: UInt64 = 0
-    /// When to try lost Postgres connections again (monotonic nanoseconds; 0: none lost).
-    private var reconnectAt: UInt64 = 0
+    private let config: Config
 
     init(loop: EventLoop, signer: TokenSigner, db: DbEndpoint, host: String, ports: [UInt16], readConnections: Int,
          writeConnections: Int, started: UInt64, pause: Pause, bufferCount: Int, bufferSize: Int)
     {
         precondition(readConnections + writeConnections <= 64, "at most 64 Postgres connections per reactor")
         self.loop = loop
-        self.signer = signer
-        self.db = db
-        self.host = host
-        self.ports = ports
-        self.readConnections = readConnections
-        self.started = started
-        self.pause = pause
-        self.bufferCount = bufferCount
-        self.bufferSize = bufferSize
-        pipeGenerations = Array(repeating: 0, count: readConnections + writeConnections)
-        freeSlots.reserveCapacity(4096)
-        pipelinedSlots.reserveCapacity(256)
-        pipes = UniqueArray(capacity: readConnections + writeConnections)
-        for _ in 0..<(readConnections + writeConnections) { pipes.append(Pipeline(started: started)) }
+        config = Config(signer: signer, db: db, host: host, ports: ports, readConnections: readConnections,
+                        writeConnections: writeConnections, started: started, pause: pause, bufferCount: bufferCount,
+                        bufferSize: bufferSize)
     }
 
-    // ---------- the loop ----------
-
+    /// The loop. The ring is made here, on the thread that submits to it (SINGLE_ISSUER), and everything that uses it
+    /// lives in `State`, which only this loop holds: there is no reactor state without a ring, and none of it can be
+    /// reached from anywhere else. The actor is the thread; the state is a value it owns.
     func run() async {
         // A descriptor table of this thread's own: a million sockets don't share one table's lock.
         Sys.unshareFiles()
-        // The ring is made here, on the thread that submits to it.
+        let ring: IORing
         do {
             ring = try IORing(entries: 4096, completions: 65536, options: .singleThread)
-            bufferGroup = try ring!.registerBuffers(count: UInt32(bufferCount), size: UInt32(bufferSize))
         } catch {
             fatalError("io_uring: \(error)")
         }
-        for (i, port) in ports.enumerated() {
-            let fd: Int32
-            do {
-                fd = try Sys.bindListener(host: host, port: port)
-            } catch {
-                fatalError("failed to bind listener: \(error)")
-            }
-            listeners.append(fd)
-            armAccept(i)
-        }
-        armWake()
-        reconnect()
-        var pauseEnd: UInt64 = 0
+        var state = State(ring: ring, loop: loop, config: config)
+        state.start()
         while true {
-            // One enter per turn, on this actor's own thread: the last turn's sends go in, then the wait. Through the rest
-            // of a pause the completions gather (a full turn's worth ends it early); after that it lasts until a
-            // completion, a job queued for the actor (its eventfd read), or a second while a lost Postgres connection
-            // waits to be retried.
+            if state.turn() { await Task.yield() }
+        }
+    }
+}
+
+extension Reactor {
+    /// What `init` was given, for the state `run` makes.
+    struct Config {
+        let signer: TokenSigner
+        let db: DbEndpoint
+        let host: String
+        let ports: [UInt16]
+        let readConnections: Int
+        let writeConnections: Int
+        let started: UInt64
+        let pause: Pause
+        let bufferCount: Int
+        let bufferSize: Int
+    }
+
+    /// Everything a request touches: the ring, the listeners, the connection slots, the Postgres pipelines and the
+    /// buffers, owned by the reactor's running loop.
+    struct State: ~Copyable {
+        private let loop: EventLoop
+        private let signer: TokenSigner
+        private let db: DbEndpoint
+        private let host: String
+        private let ports: [UInt16]
+        private let readConnections: Int
+        private let started: UInt64
+        private let pause: Pause
+
+        /// This reactor's ring: one issuer, and completions posted only when it asks (SINGLE_ISSUER, DEFER_TASKRUN).
+        private var ring: IORing
+        /// The listening sockets, one per port.
+        private var listeners: [Int32] = []
+        private var slots = UniqueArray<ClientSlot>(capacity: 4096)
+        private var freeSlots: [UInt32] = []
+        /// Error bodies are written here, and sent from here.
+        private var errorBody = ByteBuffer(capacity: 256)
+        /// Bodies of at least `gzipMinimum` bytes go out compressed to a client that accepts gzip: the feed, 5 KB to
+        /// about 2.
+        private var gzip = Gzip()
+        private var gzipped = ByteBuffer(capacity: 16 * 1024)
+        private var pipelinedSlots: [UInt32] = []
+        /// A turn that took this many completions goes straight on to the next (see `turn`).
+        private let maxEvents = 1024
+        /// The provided buffers multishot receives fill: a buffer is taken when bytes arrive and given back once parsed.
+        private var bufferGroup: UInt16 = 0
+        private let bufferCount: Int
+        private let bufferSize: Int
+        /// The eventfd's 8 bytes, where the wake read lands.
+        private let wakeBytes = UnsafeMutableRawBufferPointer.allocate(byteCount: 8, alignment: 8)
+        /// Connections whose multishot receive ended for want of a buffer: armed again once the turn gave its back.
+        private var starved: [(slot: UInt32, epoch: UInt32)] = []
+        /// Each pipeline's connection, counted, in its requests' tokens: a lost connection's late completions are told
+        /// apart.
+        private var pipeGenerations: [UInt32]
+        /// The Postgres connections: `readConnections` for reads, then the write connections.
+        private var pipes = UniqueArray<Pipeline>()
+        /// The read connection this turn's reads go to, chosen at its first read.
+        private var turnReads: Int?
+        /// The write connection this turn's writes go to, chosen at its first write.
+        private var turnWrites: Int?
+        /// Pipelines with messages queued this turn (a bit each).
+        private var queued: UInt64 = 0
+        /// When to try lost Postgres connections again (monotonic nanoseconds; 0: none lost).
+        private var reconnectAt: UInt64 = 0
+        /// When the pause of the last turn ends (monotonic nanoseconds; 0: none).
+        private var pauseEnd: UInt64 = 0
+
+        init(ring: consuming IORing, loop: EventLoop, config: Config) {
+            self.ring = ring
+            self.loop = loop
+            signer = config.signer
+            db = config.db
+            host = config.host
+            ports = config.ports
+            readConnections = config.readConnections
+            started = config.started
+            pause = config.pause
+            bufferCount = config.bufferCount
+            bufferSize = config.bufferSize
+            let connections = config.readConnections + config.writeConnections
+            pipeGenerations = Array(repeating: 0, count: connections)
+            freeSlots.reserveCapacity(4096)
+            pipelinedSlots.reserveCapacity(256)
+            pipes = UniqueArray(capacity: connections)
+            for _ in 0..<connections { pipes.append(Pipeline(started: config.started)) }
+        }
+
+        /// The buffer ring, a listener on each port with its multishot accept, the wake read, the Postgres connections.
+        mutating func start() {
+            do {
+                bufferGroup = try ring.registerBuffers(count: UInt32(bufferCount), size: UInt32(bufferSize))
+            } catch {
+                fatalError("io_uring: \(error)")
+            }
+            for (i, port) in ports.enumerated() {
+                let fd: Int32
+                do {
+                    fd = try Sys.bindListener(host: host, port: port)
+                } catch {
+                    fatalError("failed to bind listener: \(error)")
+                }
+                listeners.append(fd)
+                armAccept(i)
+            }
+            armWake()
+            reconnect()
+        }
+
+        /// One turn. One enter, on the reactor's own thread: the last turn's sends go in, then the wait. Through the rest
+        /// of a pause the completions gather (a full turn's worth ends it early); after that it lasts until a
+        /// completion, a job queued for the actor (its eventfd read), or a second while a lost Postgres connection waits
+        /// to be retried. Whether a job waits for the actor (the loop yields to it).
+        mutating func turn() -> Bool {
             let jobsQueued = loop.willWait()
             let now = Sys.monotonicNanos()
             if jobsQueued {
-                _ = ring!.submit()
+                _ = ring.submit()
             } else if pauseEnd > now {
-                _ = ring!.submit(waitingFor: UInt32(maxEvents), timeout: .nanoseconds(Int64(pauseEnd - now)))
+                _ = ring.submit(waitingFor: UInt32(maxEvents), timeout: .nanoseconds(Int64(pauseEnd - now)))
             } else {
-                _ = ring!.submit(waitingFor: 1, timeout: reconnectAt != 0 ? .seconds(1) : nil)
+                _ = ring.submit(waitingFor: 1, timeout: reconnectAt != 0 ? .seconds(1) : nil)
             }
             let jobsWaiting = loop.didWait()
             let turnStarted = Sys.monotonicNanos()
             var n = 0
-            while let c = ring!.nextCompletion() {
+            while let c = ring.nextCompletion() {
                 n += 1
                 complete(c)
             }
             // The turn's buffers go back to the kernel here; receives that found none are armed again.
-            ring!.finishCompletions()
+            ring.finishCompletions()
             if !starved.isEmpty { rearmStarved() }
             endTurn()
             // A fixed cadence: a turn that didn't fill `maxEvents` lasts `pause.nanos` from its wait (the next wait runs
-            // until then), so what arrives meanwhile is served in the next turn: its reads share one Sync and its
-            // writes one commit. A full turn goes straight on, so the cadence can't cap throughput.
+            // until then), so what arrives meanwhile is served in the next turn: its reads share one Sync and its writes
+            // one commit. A full turn goes straight on, so the cadence can't cap throughput.
             pauseEnd = n > 0 && n < maxEvents && pause.nanos > 0 ? turnStarted + UInt64(pause.nanos) : 0
-            if jobsWaiting { await Task.yield() }
+            return jobsWaiting
         }
-    }
 
-    // ---------- completions ----------
+        // ---------- completions ----------
 
-    private func complete(_ c: IORing.Completion) {
-        let index = UInt32(truncatingIfNeeded: c.userData)
-        let epoch = UInt32(truncatingIfNeeded: c.userData >> 32) & Self.epochMask
-        switch Op(rawValue: c.userData >> 56) {
-        case .accept:
-            accepted(c, listener: Int(index))
-        case .receive:
-            received(c, slot: index, epoch: epoch)
-        case .sent:
-            sent(c, slot: index, epoch: epoch)
-        case .pipeIn:
-            // A lost connection's receive (cancelled) frees its buffers.
-            if pipeGenerations[Int(index)] & Self.epochMask == epoch { pipeReadable(Int(index), c) } else { pipes[Int(index)].conn.receiveEnded() }
-        case .pipeOut:
-            if pipeGenerations[Int(index)] & Self.epochMask == epoch { pipeSent(Int(index), c) } else { pipes[Int(index)].conn.sendEnded() }
-        case .wake:
-            armWake()
-        case .none:
-            // A cancel's own completion (token 0).
-            break
-        }
-    }
-
-    /// Whether `slot` is still the connection a request with `epoch` was made for.
-    @inline(__always) private func live(_ slot: UInt32, _ epoch: UInt32) -> Bool {
-        let s = Int(slot)
-        return s < slots.count && slots[s].fd >= 0 && slots[s].epoch & Self.epochMask == epoch
-    }
-
-    /// Accepted sockets stay blocking: every read and write on them goes through the ring, which waits for them itself.
-    private func armAccept(_ l: Int) {
-        ring!.prepare(.accept(.descriptor(listeners[l]), multishot: true), userData: Self.token(.accept, UInt32(l)))
-    }
-
-    private func armWake() {
-        ring!.prepare(.read(.descriptor(loop.wakeFD), into: wakeBytes, offset: 0), userData: Self.token(.wake, 0))
-    }
-
-    private func armReceive(_ slot: UInt32) {
-        let s = Int(slot)
-        ring!.prepare(.receiveProvided(.descriptor(slots[s].fd), group: bufferGroup, multishot: true),
-                      userData: Self.token(.receive, slot, slots[s].epoch))
-    }
-
-    /// The connection's next receive, straight into its buffer after the replies not taken yet; armed again after each.
-    private func armPipe(_ p: Int) {
-        let fd = pipes[p].conn.fd
-        let space = pipes[p].conn.receiveSpace()
-        ring!.prepare(.receive(.descriptor(fd), into: space), userData: Self.token(.pipeIn, UInt32(p), pipeGenerations[p]))
-    }
-
-    private func rearmStarved() {
-        for (slot, epoch) in starved where live(slot, epoch) && !slots[Int(slot)].peerClosed { armReceive(slot) }
-        starved.removeAll(keepingCapacity: true)
-    }
-
-    /// The turn's reads under one Sync and its writes under another, then every queued message out; lost connections
-    /// retried once a second.
-    private func endTurn() {
-        if let p = turnReads {
-            pipes[p].sync()
-            queued |= 1 << UInt64(p)
-            turnReads = nil
-        }
-        if let p = turnWrites {
-            pipes[p].sync()
-            queued |= 1 << UInt64(p)
-            turnWrites = nil
-        }
-        while queued != 0 {
-            let p = queued.trailingZeroBitCount
-            queued &= queued - 1
-            flushPipe(p)
-        }
-        if reconnectAt != 0 && Sys.monotonicNanos() >= reconnectAt { reconnect() }
-    }
-
-    // ---------- Postgres ----------
-
-    /// Connects every pipeline that has no connection (blocking: at start, and after a loss).
-    private func reconnect() {
-        reconnectAt = 0
-        for p in 0..<pipes.count where !pipes[p].conn.isOpen {
-            // A lost connection's receive or send not completed yet still uses its buffers: retried a second later.
-            if pipes[p].conn.inFlight {
-                reconnectAt = Sys.monotonicNanos() + 1_000_000_000
-                continue
+        private mutating func complete(_ c: IORing.Completion) {
+            let index = UInt32(truncatingIfNeeded: c.userData)
+            let epoch = UInt32(truncatingIfNeeded: c.userData >> 32) & Reactor.epochMask
+            switch Op(rawValue: c.userData >> 56) {
+            case .accept:
+                accepted(c, listener: Int(index))
+            case .receive:
+                received(c, slot: index, epoch: epoch)
+            case .sent:
+                sent(c, slot: index, epoch: epoch)
+            case .pipeIn:
+                // A lost connection's receive (cancelled) frees its buffers.
+                if pipeGenerations[Int(index)] & Reactor.epochMask == epoch { pipeReadable(Int(index), c) } else { pipes[Int(index)].conn.receiveEnded() }
+            case .pipeOut:
+                if pipeGenerations[Int(index)] & Reactor.epochMask == epoch { pipeSent(Int(index), c) } else { pipes[Int(index)].conn.sendEnded() }
+            case .wake:
+                armWake()
+            case .none:
+                // A cancel's own completion (token 0).
+                break
             }
-            do {
-                var conn = try PgConn.connect(db)
-                try conn.prepare(Statement.allCases)
-                conn.handToRing()
-                pipes[p].conn = conn
-                pipeGenerations[p] &+= 1
-                armPipe(p)
-            } catch {
-                Sys.logLine("postgres connect failed: \(error); retrying in 1 s")
-                reconnectAt = Sys.monotonicNanos() + 1_000_000_000
+        }
+
+        /// Whether `slot` is still the connection a request with `epoch` was made for.
+        @inline(__always) private func live(_ slot: UInt32, _ epoch: UInt32) -> Bool {
+            let s = Int(slot)
+            return s < slots.count && slots[s].fd >= 0 && slots[s].epoch & Reactor.epochMask == epoch
+        }
+
+        /// Accepted sockets stay blocking: every read and write on them goes through the ring, which waits for them itself.
+        private mutating func armAccept(_ l: Int) {
+            ring.prepare(.accept(.descriptor(listeners[l]), multishot: true), userData: Reactor.token(.accept, UInt32(l)))
+        }
+
+        private mutating func armWake() {
+            ring.prepare(.read(.descriptor(loop.wakeFD), into: wakeBytes, offset: 0), userData: Reactor.token(.wake, 0))
+        }
+
+        private mutating func armReceive(_ slot: UInt32) {
+            let s = Int(slot)
+            ring.prepare(.receiveProvided(.descriptor(slots[s].fd), group: bufferGroup, multishot: true),
+                          userData: Reactor.token(.receive, slot, slots[s].epoch))
+        }
+
+        /// The connection's next receive, straight into its buffer after the replies not taken yet; armed again after each.
+        private mutating func armPipe(_ p: Int) {
+            let fd = pipes[p].conn.fd
+            let space = pipes[p].conn.receiveSpace()
+            ring.prepare(.receive(.descriptor(fd), into: space), userData: Reactor.token(.pipeIn, UInt32(p), pipeGenerations[p]))
+        }
+
+        private mutating func rearmStarved() {
+            for (slot, epoch) in starved where live(slot, epoch) && !slots[Int(slot)].peerClosed { armReceive(slot) }
+            starved.removeAll(keepingCapacity: true)
+        }
+
+        /// The turn's reads under one Sync and its writes under another, then every queued message out; lost connections
+        /// retried once a second.
+        private mutating func endTurn() {
+            if let p = turnReads {
+                pipes[p].sync()
+                queued |= 1 << UInt64(p)
+                turnReads = nil
+            }
+            if let p = turnWrites {
+                pipes[p].sync()
+                queued |= 1 << UInt64(p)
+                turnWrites = nil
+            }
+            while queued != 0 {
+                let p = queued.trailingZeroBitCount
+                queued &= queued - 1
+                flushPipe(p)
+            }
+            if reconnectAt != 0 && Sys.monotonicNanos() >= reconnectAt { reconnect() }
+        }
+
+        // ---------- Postgres ----------
+
+        /// Connects every pipeline that has no connection (blocking: at start, and after a loss).
+        private mutating func reconnect() {
+            reconnectAt = 0
+            for p in 0..<pipes.count where !pipes[p].conn.isOpen {
+                // A lost connection's receive or send not completed yet still uses its buffers: retried a second later.
+                if pipes[p].conn.inFlight {
+                    reconnectAt = Sys.monotonicNanos() + 1_000_000_000
+                    continue
+                }
+                do {
+                    var conn = try PgConn.connect(db)
+                    try conn.prepare(Statement.allCases)
+                    conn.handToRing()
+                    pipes[p].conn = conn
+                    pipeGenerations[p] &+= 1
+                    armPipe(p)
+                } catch {
+                    Sys.logLine("postgres connect failed: \(error); retrying in 1 s")
+                    reconnectAt = Sys.monotonicNanos() + 1_000_000_000
+                    return
+                }
+            }
+        }
+
+        /// The read connection this turn's reads go to: the open one with the fewest requests waiting, until it has
+        /// `readsPerSync` of them; then they go under a Sync, and the next ones to the next connection, so one backend
+        /// doesn't answer a whole busy turn alone.
+        private mutating func readPipe() -> Int? {
+            if let p = turnReads {
+                if pipes[p].unsynced < Reactor.readsPerSync { return p }
+                pipes[p].sync()
+                queued |= 1 << UInt64(p)
+            }
+            turnReads = leastLoaded(0..<readConnections)
+            return turnReads
+        }
+
+        /// The write connection this turn's writes go to, chosen the same way: up to `writesPerSync` of them share a Sync,
+        /// so they commit together, and each response waits for that commit.
+        private mutating func writePipe() -> Int? {
+            if let p = turnWrites {
+                if pipes[p].unsynced < Reactor.writesPerSync { return p }
+                pipes[p].sync()
+                queued |= 1 << UInt64(p)
+            }
+            turnWrites = leastLoaded(readConnections..<pipes.count)
+            return turnWrites
+        }
+
+        private mutating func leastLoaded(_ range: Range<Int>) -> Int? {
+            var best: Int?
+            var load = Int.max
+            for p in range where pipes[p].conn.isOpen && pipes[p].pending < load {
+                best = p
+                load = pipes[p].pending
+            }
+            return best
+        }
+
+        /// Pipeline `p`'s queued messages go out: one send in flight, what queues meanwhile after it.
+        private mutating func flushPipe(_ p: Int) {
+            guard pipes[p].conn.isOpen, let bytes = pipes[p].conn.takeSend() else { return }
+            ring.prepare(.send(.descriptor(pipes[p].conn.fd), bytes), userData: Reactor.token(.pipeOut, UInt32(p), pipeGenerations[p]))
+        }
+
+        /// Pipeline `p`'s send completed: the rest of it goes, then what queued meanwhile.
+        private mutating func pipeSent(_ p: Int, _ c: IORing.Completion) {
+            guard pipes[p].conn.isOpen else { return pipes[p].conn.sendEnded() }
+            if c.result <= 0 && c.result != -EAGAIN && c.result != -EINTR {
+                pipes[p].conn.sendEnded()
+                pipeLost(p)
                 return
             }
-        }
-    }
-
-    /// The read connection this turn's reads go to: the open one with the fewest requests waiting, until it has
-    /// `readsPerSync` of them; then they go under a Sync, and the next ones to the next connection, so one backend
-    /// doesn't answer a whole busy turn alone.
-    private func readPipe() -> Int? {
-        if let p = turnReads {
-            if pipes[p].unsynced < Self.readsPerSync { return p }
-            pipes[p].sync()
-            queued |= 1 << UInt64(p)
-        }
-        turnReads = leastLoaded(0..<readConnections)
-        return turnReads
-    }
-
-    /// The write connection this turn's writes go to, chosen the same way: up to `writesPerSync` of them share a Sync,
-    /// so they commit together, and each response waits for that commit.
-    private func writePipe() -> Int? {
-        if let p = turnWrites {
-            if pipes[p].unsynced < Self.writesPerSync { return p }
-            pipes[p].sync()
-            queued |= 1 << UInt64(p)
-        }
-        turnWrites = leastLoaded(readConnections..<pipes.count)
-        return turnWrites
-    }
-
-    private func leastLoaded(_ range: Range<Int>) -> Int? {
-        var best: Int?
-        var load = Int.max
-        for p in range where pipes[p].conn.isOpen && pipes[p].pending < load {
-            best = p
-            load = pipes[p].pending
-        }
-        return best
-    }
-
-    /// Pipeline `p`'s queued messages go out: one send in flight, what queues meanwhile after it.
-    private func flushPipe(_ p: Int) {
-        guard pipes[p].conn.isOpen, let bytes = pipes[p].conn.takeSend() else { return }
-        ring!.prepare(.send(.descriptor(pipes[p].conn.fd), bytes), userData: Self.token(.pipeOut, UInt32(p), pipeGenerations[p]))
-    }
-
-    /// Pipeline `p`'s send completed: the rest of it goes, then what queued meanwhile.
-    private func pipeSent(_ p: Int, _ c: IORing.Completion) {
-        guard pipes[p].conn.isOpen else { return pipes[p].conn.sendEnded() }
-        if c.result <= 0 && c.result != -EAGAIN && c.result != -EINTR {
-            pipes[p].conn.sendEnded()
-            pipeLost(p)
-            return
-        }
-        if let rest = pipes[p].conn.sent(max(Int(c.result), 0)) {
-            ring!.prepare(.send(.descriptor(pipes[p].conn.fd), rest), userData: Self.token(.pipeOut, UInt32(p), pipeGenerations[p]))
-        } else {
-            flushPipe(p)
-        }
-    }
-
-    /// Pipeline `p`'s receive completed: replies, the end of the connection, or an error.
-    private func pipeReadable(_ p: Int, _ c: IORing.Completion) {
-        guard pipes[p].conn.isOpen else { return pipes[p].conn.receiveEnded() }
-        if c.result <= 0 {
-            pipes[p].conn.receiveEnded()
-            if c.result == -EAGAIN || c.result == -EINTR { armPipe(p) } else { pipeLost(p) }
-            return
-        }
-        pipes[p].conn.landed(Int(c.result))
-        while let answer = pipes[p].next() { deliver(answer, from: p) }
-        if pipes[p].resent {
-            // Writes of a rolled-back group, queued again: they go out at the end of the turn.
-            pipes[p].resent = false
-            queued |= 1 << UInt64(p)
-        }
-        armPipe(p)
-        drainPipelined()
-    }
-
-    /// A lost connection: everything waiting on it is answered with an error, and it is retried a second later.
-    private func pipeLost(_ p: Int) {
-        Sys.logLine("postgres connection lost; reconnecting")
-        // Its receive (and send) would hold the closed socket: cancelled, their completions told apart by the generation,
-        // and the buffers they use kept until then (see `PgConn.close`).
-        if pipes[p].conn.receiving { ring!.prepare(.cancel(userData: Self.token(.pipeIn, UInt32(p), pipeGenerations[p])), userData: 0) }
-        if pipes[p].conn.sending { ring!.prepare(.cancel(userData: Self.token(.pipeOut, UInt32(p), pipeGenerations[p])), userData: 0) }
-        pipeGenerations[p] &+= 1
-        pipes[p].conn.close()
-        while let answer = pipes[p].abandonNext() { deliver(answer, from: p) }
-        if turnReads == p { turnReads = nil }
-        if turnWrites == p { turnWrites = nil }
-        queued &= ~(1 << UInt64(p))
-        if reconnectAt == 0 { reconnectAt = Sys.monotonicNanos() + 1_000_000_000 }
-        drainPipelined()
-    }
-
-    /// A response from pipeline `p`, for its connection if that is still the one that asked.
-    private func deliver(_ answer: Pipeline.Answer, from p: Int) {
-        let s = Int(answer.slot)
-        guard s < slots.count, slots[s].fd >= 0, slots[s].epoch == answer.epoch, slots[s].inFlight else { return }
-        let hasBufferedRx = !slots[s].rx.isEmpty
-        pipes[p].body.withBytes { writeResponse(answer.slot, answer.status, $0) }
-        if hasBufferedRx { pipelinedSlots.append(answer.slot) }
-    }
-
-    /// Requests that were waiting behind the ones just answered.
-    private func drainPipelined() {
-        guard !pipelinedSlots.isEmpty else { return }
-        let ready = pipelinedSlots
-        pipelinedSlots.removeAll(keepingCapacity: true)
-        for slot in ready { drainRxBuf(slot) }
-    }
-
-    // ---------- connections ----------
-
-    /// A connection from a listener's multishot accept (which stays armed until it fails).
-    private func accepted(_ c: IORing.Completion, listener l: Int) {
-        if c.result >= 0 { open(c.result) }
-        if !c.hasMore { armAccept(l) }
-    }
-
-    /// A slot for an accepted connection, then its multishot receive.
-    private func open(_ client: Int32) {
-        let slot: UInt32
-        if let idx = freeSlots.popLast() {
-            let s = Int(idx)
-            slots[s].fd = client
-            slots[s].inFlight = false
-            slots[s].closeOnDone = false
-            slots[s].continueSent = false
-            slots[s].peerClosed = false
-            slots[s].txOff = 0
-            slot = idx
-        } else {
-            slots.append(ClientSlot(fd: client))
-            slot = UInt32(slots.count - 1)
-        }
-        armReceive(slot)
-    }
-
-    /// A multishot receive's completion: bytes in a provided buffer (parsed, then the buffer given back), the end of
-    /// the stream, or an error. It stays armed while the completion says so.
-    private func received(_ c: IORing.Completion, slot: UInt32, epoch: UInt32) {
-        if let id = c.bufferID {
-            if c.result > 0 && live(slot, epoch) {
-                take(ring!.buffer(group: bufferGroup, id, count: Int(c.result)), slot)
+            if let rest = pipes[p].conn.sent(max(Int(c.result), 0)) {
+                ring.prepare(.send(.descriptor(pipes[p].conn.fd), rest), userData: Reactor.token(.pipeOut, UInt32(p), pipeGenerations[p]))
+            } else {
+                flushPipe(p)
             }
-            ring!.recycle(group: bufferGroup, buffer: id)
         }
-        guard live(slot, epoch) else { return }
-        if c.result == 0 {
-            peerDone(slot)
-        } else if c.result < 0 {
-            // Out of buffers ends the receive: armed again at the end of the turn, once the turn's are back.
-            if c.result == -ENOBUFS { starved.append((slot, epoch)) } else { dropConn(slot) }
-        } else if !c.hasMore && !slots[Int(slot)].peerClosed {
+
+        /// Pipeline `p`'s receive completed: replies, the end of the connection, or an error.
+        private mutating func pipeReadable(_ p: Int, _ c: IORing.Completion) {
+            guard pipes[p].conn.isOpen else { return pipes[p].conn.receiveEnded() }
+            if c.result <= 0 {
+                pipes[p].conn.receiveEnded()
+                if c.result == -EAGAIN || c.result == -EINTR { armPipe(p) } else { pipeLost(p) }
+                return
+            }
+            pipes[p].conn.landed(Int(c.result))
+            while let answer = pipes[p].next() { deliver(answer, from: p) }
+            if pipes[p].resent {
+                // Writes of a rolled-back group, queued again: they go out at the end of the turn.
+                pipes[p].resent = false
+                queued |= 1 << UInt64(p)
+            }
+            armPipe(p)
+            drainPipelined()
+        }
+
+        /// A lost connection: everything waiting on it is answered with an error, and it is retried a second later.
+        private mutating func pipeLost(_ p: Int) {
+            Sys.logLine("postgres connection lost; reconnecting")
+            // Its receive (and send) would hold the closed socket: cancelled, their completions told apart by the generation,
+            // and the buffers they use kept until then (see `PgConn.close`).
+            if pipes[p].conn.receiving { ring.prepare(.cancel(userData: Reactor.token(.pipeIn, UInt32(p), pipeGenerations[p])), userData: 0) }
+            if pipes[p].conn.sending { ring.prepare(.cancel(userData: Reactor.token(.pipeOut, UInt32(p), pipeGenerations[p])), userData: 0) }
+            pipeGenerations[p] &+= 1
+            pipes[p].conn.close()
+            while let answer = pipes[p].abandonNext() { deliver(answer, from: p) }
+            if turnReads == p { turnReads = nil }
+            if turnWrites == p { turnWrites = nil }
+            queued &= ~(1 << UInt64(p))
+            if reconnectAt == 0 { reconnectAt = Sys.monotonicNanos() + 1_000_000_000 }
+            drainPipelined()
+        }
+
+        /// A response from pipeline `p`, for its connection if that is still the one that asked.
+        private mutating func deliver(_ answer: Pipeline.Answer, from p: Int) {
+            let s = Int(answer.slot)
+            guard s < slots.count, slots[s].fd >= 0, slots[s].epoch == answer.epoch, slots[s].inFlight else { return }
+            let hasBufferedRx = !slots[s].rx.isEmpty
+            // `send` copies the body out before anything changes the pipeline's buffer.
+            let reply = pipes[p].body.withBytes { $0 }
+            writeResponse(answer.slot, answer.status, reply)
+            if hasBufferedRx { pipelinedSlots.append(answer.slot) }
+        }
+
+        /// Requests that were waiting behind the ones just answered.
+        private mutating func drainPipelined() {
+            guard !pipelinedSlots.isEmpty else { return }
+            let ready = pipelinedSlots
+            pipelinedSlots.removeAll(keepingCapacity: true)
+            for slot in ready { drainRxBuf(slot) }
+        }
+
+        // ---------- connections ----------
+
+        /// A connection from a listener's multishot accept (which stays armed until it fails).
+        private mutating func accepted(_ c: IORing.Completion, listener l: Int) {
+            if c.result >= 0 { open(c.result) }
+            if !c.hasMore { armAccept(l) }
+        }
+
+        /// A slot for an accepted connection, then its multishot receive.
+        private mutating func open(_ client: Int32) {
+            let slot: UInt32
+            if let idx = freeSlots.popLast() {
+                let s = Int(idx)
+                slots[s].fd = client
+                slots[s].inFlight = false
+                slots[s].closeOnDone = false
+                slots[s].continueSent = false
+                slots[s].peerClosed = false
+                slots[s].txOff = 0
+                slot = idx
+            } else {
+                slots.append(ClientSlot(fd: client))
+                slot = UInt32(slots.count - 1)
+            }
             armReceive(slot)
         }
-    }
 
-    /// Bytes a receive brought: parsed in place when the connection has nothing left over (what follows a complete
-    /// request is copied out), else after what it has.
-    private func take(_ bytes: UnsafeRawBufferPointer, _ slot: UInt32) {
-        let s = Int(slot)
-        let n = bytes.count
-        guard !slots[s].inFlight && slots[s].rx.isEmpty else {
-            slots[s].rx.append(bytes)
-            drainRxBuf(slot)
-            return
-        }
-        let outcome = HTTP.parseRequest(signer, Span(_unsafeElements: bytes.assumingMemoryBound(to: UInt8.self)))
-        switch consume outcome {
-        case .complete(let consumed, let closeAfter, let acceptsGzip, let dispatch):
-            slots[s].continueSent = false
-            slots[s].closeOnDone = closeAfter
-            slots[s].acceptsGzip = acceptsGzip
-            slots[s].inFlight = true
-            if consumed < n { slots[s].rx.append(UnsafeRawBufferPointer(rebasing: bytes[consumed..<n])) }
-            if handle(dispatch, slot) && slots[s].fd >= 0 && !slots[s].rx.isEmpty { drainRxBuf(slot) }
-        case .incomplete(let sendContinue):
-            slots[s].rx.append(bytes)
-            if sendContinue && !slots[s].continueSent {
-                slots[s].continueSent = true
-                writeRaw(slot, "HTTP/1.1 100 Continue\r\n\r\n")
-            }
-        case .reject(let status):
-            rejectConn(slot, status)
-        }
-    }
-
-    private func dropConn(_ slot: UInt32) {
-        let s = Int(slot)
-        if slots[s].fd < 0 { return }
-        // Shut down first: the connection's armed receive and poll then complete (their tokens are stale by then).
-        _ = sys_shutdown(slots[s].fd, 2)
-        _ = sys_close(slots[s].fd)
-        slots[s].fd = -1
-        let nextEpoch = slots[s].epoch &+ 1
-        slots[s].epoch = nextEpoch == Self.epochClosed ? 0 : nextEpoch
-        slots[s].rx.release()
-        slots[s].inFlight = false
-        // A send in flight still reads `tx`: its completion frees the buffers and the slot (see `sent`).
-        if slots[s].sending { return }
-        slots[s].releaseOutput()
-        freeSlots.append(slot)
-    }
-
-    /// The peer is done sending (it may have only half-closed): what it sent is answered, then the connection closes.
-    private func peerDone(_ slot: UInt32) {
-        let s = Int(slot)
-        let pending = slots[s].inFlight || slots[s].sending || !slots[s].rx.isEmpty
-        guard pending else {
-            dropConn(slot)
-            return
-        }
-        // Its multishot receive ended with the stream.
-        slots[s].peerClosed = true
-        if !slots[s].inFlight { drainRxBuf(slot) }
-    }
-
-    /// Answers an error now, or queues the statement on a pipeline. Whether it was answered.
-    private func handle(_ dispatch: consuming Router.Dispatch, _ slot: UInt32) -> Bool {
-        let epoch = slots[Int(slot)].epoch
-        switch consume dispatch {
-        case .error(let status, let message):
-            writeError(slot, status, message)
-            return true
-        case .read(let query):
-            guard let p = readPipe() else { return unavailable(query, slot) }
-            pipes[p].send(query, slot: slot, epoch: epoch)
-            return false
-        case .write(let query):
-            guard let p = writePipe() else { return unavailable(query, slot) }
-            pipes[p].send(query, slot: slot, epoch: epoch)
-            return false
-        }
-    }
-
-    /// No connection to send `query` on.
-    private func unavailable(_ query: Query, _ slot: UInt32) -> Bool {
-        if case .health = query {
-            errorBody.removeAll()
-            errorBody.append("{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"no connection to Postgres\"}")
-            errorBody.withBytes { writeResponse(slot, 503, $0) }
-        } else {
-            writeError(slot, 500, "internal server error")
-        }
-        return true
-    }
-
-    /// SPEC.md's `{"error":"<message>"}`.
-    private func writeError(_ slot: UInt32, _ status: UInt16, _ message: StaticString) {
-        errorBody.removeAll()
-        JSON.writeError(&errorBody, message)
-        errorBody.withBytes { writeResponse(slot, status, $0) }
-    }
-
-    private func drainRxBuf(_ slot: UInt32) {
-        let s = Int(slot)
-        while true {
-            if slots[s].fd < 0 || slots[s].inFlight || slots[s].rx.isEmpty {
-                if slots[s].fd >= 0 && slots[s].rx.isEmpty {
-                    slots[s].rx.release()
-                    if slots[s].peerClosed && !slots[s].inFlight && !slots[s].sending { dropConn(slot) }
+        /// A multishot receive's completion: bytes in a provided buffer (parsed, then the buffer given back), the end of
+        /// the stream, or an error. It stays armed while the completion says so.
+        private mutating func received(_ c: IORing.Completion, slot: UInt32, epoch: UInt32) {
+            if let id = c.bufferID {
+                if c.result > 0 && live(slot, epoch) {
+                    take(ring.buffer(group: bufferGroup, id, count: Int(c.result)), slot)
                 }
+                ring.recycle(group: bufferGroup, buffer: id)
+            }
+            guard live(slot, epoch) else { return }
+            if c.result == 0 {
+                peerDone(slot)
+            } else if c.result < 0 {
+                // Out of buffers ends the receive: armed again at the end of the turn, once the turn's are back.
+                if c.result == -ENOBUFS { starved.append((slot, epoch)) } else { dropConn(slot) }
+            } else if !c.hasMore && !slots[Int(slot)].peerClosed {
+                armReceive(slot)
+            }
+        }
+
+        /// Bytes a receive brought: parsed in place when the connection has nothing left over (what follows a complete
+        /// request is copied out), else after what it has.
+        private mutating func take(_ bytes: UnsafeRawBufferPointer, _ slot: UInt32) {
+            let s = Int(slot)
+            let n = bytes.count
+            guard !slots[s].inFlight && slots[s].rx.isEmpty else {
+                slots[s].rx.append(bytes)
+                drainRxBuf(slot)
                 return
             }
-            let outcome = HTTP.parseRequest(signer, slots[s].rx.span)
+            let outcome = HTTP.parseRequest(signer, Span(_unsafeElements: bytes.assumingMemoryBound(to: UInt8.self)))
             switch consume outcome {
             case .complete(let consumed, let closeAfter, let acceptsGzip, let dispatch):
                 slots[s].continueSent = false
                 slots[s].closeOnDone = closeAfter
                 slots[s].acceptsGzip = acceptsGzip
                 slots[s].inFlight = true
-                if consumed == slots[s].rx.count { slots[s].rx.release() } else { slots[s].rx.removeFirst(consumed) }
-                if !handle(dispatch, slot) { return }
+                if consumed < n { slots[s].rx.append(UnsafeRawBufferPointer(rebasing: bytes[consumed..<n])) }
+                if handle(dispatch, slot) && slots[s].fd >= 0 && !slots[s].rx.isEmpty { drainRxBuf(slot) }
             case .incomplete(let sendContinue):
-                // A request the peer will never finish.
-                if slots[s].peerClosed {
-                    if !slots[s].sending { dropConn(slot) } else { slots[s].closeOnDone = true }
-                    return
-                }
+                slots[s].rx.append(bytes)
                 if sendContinue && !slots[s].continueSent {
                     slots[s].continueSent = true
                     writeRaw(slot, "HTTP/1.1 100 Continue\r\n\r\n")
                 }
-                return
             case .reject(let status):
                 rejectConn(slot, status)
-                return
             }
         }
-    }
 
-    private func rejectConn(_ slot: UInt32, _ status: UInt16) {
-        let s = Int(slot)
-        slots[s].closeOnDone = true
-        slots[s].inFlight = true
-        slots[s].rx.release()
-        writeError(slot, status, HTTP.errorMessage(status))
-    }
-
-    // ---------- writing ----------
-
-    private func writeResponse(_ slot: UInt32, _ status: UInt16, _ body: UnsafeRawBufferPointer) {
-        let s = Int(slot)
-        slots[s].inFlight = false
-        let close = slots[s].closeOnDone
-        // The head in an inline array on the stack: no allocation per response.
-        var head = InlineArray<192, UInt8>(repeating: 0)
-        var headSpan = head.mutableSpan
-        if slots[s].acceptsGzip && body.count >= Self.gzipMinimum {
-            gzipped.removeAll()
-            _ = gzipped.appendSpare(maximum: Gzip.bound(body.count)) { gzip.compress(body, into: $0) }
-            if gzipped.count < body.count {
-                let n = HTTP.formatHeader(into: &headSpan, status, gzipped.count, close, gzip: true)
-                head.span.withUnsafeBytes { h in
-                    gzipped.withBytes { send(slot, UnsafeRawBufferPointer(rebasing: h[0..<n]), $0) }
-                }
-                return
-            }
-        }
-        let n = HTTP.formatHeader(into: &headSpan, status, body.count, close, gzip: false)
-        head.span.withUnsafeBytes { send(slot, UnsafeRawBufferPointer(rebasing: $0[0..<n]), body) }
-    }
-
-    /// Queues head and body on the connection: sent through the ring at once, or after the send in flight.
-    private func send(_ slot: UInt32, _ header: UnsafeRawBufferPointer, _ body: UnsafeRawBufferPointer) {
-        let s = Int(slot)
-        if slots[s].sending {
-            slots[s].txNext.append(header)
-            slots[s].txNext.append(body)
-            return
-        }
-        slots[s].tx.append(header)
-        slots[s].tx.append(body)
-        sendTx(slot)
-    }
-
-    private func writeRaw(_ slot: UInt32, _ raw: StaticString) {
-        send(slot, UnsafeRawBufferPointer(start: raw.utf8Start, count: raw.utf8CodeUnitCount), UnsafeRawBufferPointer(start: nil, count: 0))
-    }
-
-    /// A send of what is left of `tx`, from `txOff`: the kernel reads `tx` until its completion, so nothing changes it
-    /// meanwhile (what follows goes to `txNext`).
-    private func sendTx(_ slot: UInt32) {
-        let s = Int(slot)
-        slots[s].sending = true
-        let fd = slots[s].fd
-        let off = slots[s].txOff
-        let token = Self.token(.sent, slot, slots[s].epoch)
-        slots[s].tx.withBytes { bytes in
-            ring!.prepare(.send(.descriptor(fd), UnsafeRawBufferPointer(rebasing: bytes[off...])), userData: token)
-        }
-    }
-
-    /// A send's completion: what it took. The rest goes again, then what queued behind it; once everything is sent the
-    /// buffers go (an idle connection holds none), and the connection closes if its response said so or the peer is
-    /// done. A connection dropped while its send was in flight is freed only now.
-    private func sent(_ c: IORing.Completion, slot: UInt32, epoch: UInt32) {
-        let s = Int(slot)
-        guard slots[s].sending else { return }
-        slots[s].sending = false
-        guard live(slot, epoch) else {
+        private mutating func dropConn(_ slot: UInt32) {
+            let s = Int(slot)
+            if slots[s].fd < 0 { return }
+            // Shut down first: the connection's armed receive and poll then complete (their tokens are stale by then).
+            _ = sys_shutdown(slots[s].fd, 2)
+            _ = sys_close(slots[s].fd)
+            slots[s].fd = -1
+            let nextEpoch = slots[s].epoch &+ 1
+            slots[s].epoch = nextEpoch == Reactor.epochClosed ? 0 : nextEpoch
+            slots[s].rx.release()
+            slots[s].inFlight = false
+            // A send in flight still reads `tx`: its completion frees the buffers and the slot (see `sent`).
+            if slots[s].sending { return }
             slots[s].releaseOutput()
             freeSlots.append(slot)
-            return
         }
-        if c.result <= 0 {
-            if c.result == -EAGAIN || c.result == -EINTR { sendTx(slot) } else { dropConn(slot) }
-            return
+
+        /// The peer is done sending (it may have only half-closed): what it sent is answered, then the connection closes.
+        private mutating func peerDone(_ slot: UInt32) {
+            let s = Int(slot)
+            let pending = slots[s].inFlight || slots[s].sending || !slots[s].rx.isEmpty
+            guard pending else {
+                dropConn(slot)
+                return
+            }
+            // Its multishot receive ended with the stream.
+            slots[s].peerClosed = true
+            if !slots[s].inFlight { drainRxBuf(slot) }
         }
-        slots[s].txOff += Int(c.result)
-        if slots[s].txOff < slots[s].tx.count {
+
+        /// Answers an error now, or queues the statement on a pipeline. Whether it was answered.
+        private mutating func handle(_ dispatch: consuming Router.Dispatch, _ slot: UInt32) -> Bool {
+            let epoch = slots[Int(slot)].epoch
+            switch consume dispatch {
+            case .error(let status, let message):
+                writeError(slot, status, message)
+                return true
+            case .read(let query):
+                guard let p = readPipe() else { return unavailable(query, slot) }
+                pipes[p].send(query, slot: slot, epoch: epoch)
+                return false
+            case .write(let query):
+                guard let p = writePipe() else { return unavailable(query, slot) }
+                pipes[p].send(query, slot: slot, epoch: epoch)
+                return false
+            }
+        }
+
+        /// No connection to send `query` on.
+        private mutating func unavailable(_ query: Query, _ slot: UInt32) -> Bool {
+            if case .health = query {
+                errorBody.removeAll()
+                errorBody.append("{\"status\":\"degraded\",\"db\":\"unreachable\",\"error\":\"no connection to Postgres\"}")
+                let reply = errorBody.withBytes { $0 }
+                writeResponse(slot, 503, reply)
+            } else {
+                writeError(slot, 500, "internal server error")
+            }
+            return true
+        }
+
+        /// SPEC.md's `{"error":"<message>"}`.
+        private mutating func writeError(_ slot: UInt32, _ status: UInt16, _ message: StaticString) {
+            errorBody.removeAll()
+            JSON.writeError(&errorBody, message)
+            let reply = errorBody.withBytes { $0 }
+            writeResponse(slot, status, reply)
+        }
+
+        private mutating func drainRxBuf(_ slot: UInt32) {
+            let s = Int(slot)
+            while true {
+                if slots[s].fd < 0 || slots[s].inFlight || slots[s].rx.isEmpty {
+                    if slots[s].fd >= 0 && slots[s].rx.isEmpty {
+                        slots[s].rx.release()
+                        if slots[s].peerClosed && !slots[s].inFlight && !slots[s].sending { dropConn(slot) }
+                    }
+                    return
+                }
+                let outcome = HTTP.parseRequest(signer, slots[s].rx.span)
+                switch consume outcome {
+                case .complete(let consumed, let closeAfter, let acceptsGzip, let dispatch):
+                    slots[s].continueSent = false
+                    slots[s].closeOnDone = closeAfter
+                    slots[s].acceptsGzip = acceptsGzip
+                    slots[s].inFlight = true
+                    if consumed == slots[s].rx.count { slots[s].rx.release() } else { slots[s].rx.removeFirst(consumed) }
+                    if !handle(dispatch, slot) { return }
+                case .incomplete(let sendContinue):
+                    // A request the peer will never finish.
+                    if slots[s].peerClosed {
+                        if !slots[s].sending { dropConn(slot) } else { slots[s].closeOnDone = true }
+                        return
+                    }
+                    if sendContinue && !slots[s].continueSent {
+                        slots[s].continueSent = true
+                        writeRaw(slot, "HTTP/1.1 100 Continue\r\n\r\n")
+                    }
+                    return
+                case .reject(let status):
+                    rejectConn(slot, status)
+                    return
+                }
+            }
+        }
+
+        private mutating func rejectConn(_ slot: UInt32, _ status: UInt16) {
+            let s = Int(slot)
+            slots[s].closeOnDone = true
+            slots[s].inFlight = true
+            slots[s].rx.release()
+            writeError(slot, status, HTTP.errorMessage(status))
+        }
+
+        // ---------- writing ----------
+
+        private mutating func writeResponse(_ slot: UInt32, _ status: UInt16, _ body: UnsafeRawBufferPointer) {
+            let s = Int(slot)
+            slots[s].inFlight = false
+            let close = slots[s].closeOnDone
+            // The head in an inline array on the stack: no allocation per response.
+            var head = InlineArray<192, UInt8>(repeating: 0)
+            var headSpan = head.mutableSpan
+            if slots[s].acceptsGzip && body.count >= Reactor.gzipMinimum {
+                gzipped.removeAll()
+                _ = gzipped.appendSpare(maximum: Gzip.bound(body.count)) { gzip.compress(body, into: $0) }
+                if gzipped.count < body.count {
+                    let n = HTTP.formatHeader(into: &headSpan, status, gzipped.count, close, gzip: true)
+                    let compressed = gzipped.withBytes { $0 }
+                    head.span.withUnsafeBytes { send(slot, UnsafeRawBufferPointer(rebasing: $0[0..<n]), compressed) }
+                    return
+                }
+            }
+            let n = HTTP.formatHeader(into: &headSpan, status, body.count, close, gzip: false)
+            head.span.withUnsafeBytes { send(slot, UnsafeRawBufferPointer(rebasing: $0[0..<n]), body) }
+        }
+
+        /// Queues head and body on the connection: sent through the ring at once, or after the send in flight.
+        private mutating func send(_ slot: UInt32, _ header: UnsafeRawBufferPointer, _ body: UnsafeRawBufferPointer) {
+            let s = Int(slot)
+            if slots[s].sending {
+                slots[s].txNext.append(header)
+                slots[s].txNext.append(body)
+                return
+            }
+            slots[s].tx.append(header)
+            slots[s].tx.append(body)
             sendTx(slot)
-            return
         }
-        slots[s].tx.release()
-        slots[s].txOff = 0
-        if !slots[s].txNext.isEmpty {
-            slots[s].takeNext()
-            sendTx(slot)
-            return
+
+        private mutating func writeRaw(_ slot: UInt32, _ raw: StaticString) {
+            send(slot, UnsafeRawBufferPointer(start: raw.utf8Start, count: raw.utf8CodeUnitCount), UnsafeRawBufferPointer(start: nil, count: 0))
         }
-        if !slots[s].inFlight && (slots[s].closeOnDone || (slots[s].peerClosed && slots[s].rx.isEmpty)) { dropConn(slot) }
+
+        /// A send of what is left of `tx`, from `txOff`: the kernel reads `tx` until its completion, so nothing changes it
+        /// meanwhile (what follows goes to `txNext`).
+        private mutating func sendTx(_ slot: UInt32) {
+            let s = Int(slot)
+            slots[s].sending = true
+            let fd = slots[s].fd
+            let off = slots[s].txOff
+            let token = Reactor.token(.sent, slot, slots[s].epoch)
+            slots[s].tx.withBytes { bytes in
+                ring.prepare(.send(.descriptor(fd), UnsafeRawBufferPointer(rebasing: bytes[off...])), userData: token)
+            }
+        }
+
+        /// A send's completion: what it took. The rest goes again, then what queued behind it; once everything is sent the
+        /// buffers go (an idle connection holds none), and the connection closes if its response said so or the peer is
+        /// done. A connection dropped while its send was in flight is freed only now.
+        private mutating func sent(_ c: IORing.Completion, slot: UInt32, epoch: UInt32) {
+            let s = Int(slot)
+            guard slots[s].sending else { return }
+            slots[s].sending = false
+            guard live(slot, epoch) else {
+                slots[s].releaseOutput()
+                freeSlots.append(slot)
+                return
+            }
+            if c.result <= 0 {
+                if c.result == -EAGAIN || c.result == -EINTR { sendTx(slot) } else { dropConn(slot) }
+                return
+            }
+            slots[s].txOff += Int(c.result)
+            if slots[s].txOff < slots[s].tx.count {
+                sendTx(slot)
+                return
+            }
+            slots[s].tx.release()
+            slots[s].txOff = 0
+            if !slots[s].txNext.isEmpty {
+                slots[s].takeNext()
+                sendTx(slot)
+                return
+            }
+            if !slots[s].inFlight && (slots[s].closeOnDone || (slots[s].peerClosed && slots[s].rx.isEmpty)) { dropConn(slot) }
+        }
     }
 }
 
