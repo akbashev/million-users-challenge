@@ -12,6 +12,12 @@ ip netns exec bench ip link set lo up; dns "after lo up"
 ip netns exec bench sysctl -q -w net.ipv4.ip_local_port_range="1024 65535" net.core.somaxconn=65535 \
   net.ipv4.tcp_max_syn_backlog=65535 net.ipv4.tcp_tw_reuse=1; dns "after the namespace sysctls"
 sysctl -q -w fs.nr_open=8388608; dns "after fs.nr_open"
+# The runner image ships Postgres with automatic clusters off (and its own, unused): 18's cluster is made here, on 5432.
+if [ ! -d /etc/postgresql/18/main ]; then
+  pg_lsclusters -h | awk '$1 != "18" {print $1, $2}' | while read v n; do pg_dropcluster --stop "$v" "$n"; done
+  pg_createcluster 18 main --port 5432 > /dev/null
+fi
+pg_lsclusters
 CONF=/etc/postgresql/18/main
 sed -e 's/^shared_buffers.*/shared_buffers = 2GB/' -e 's/^effective_cache_size.*/effective_cache_size = 6GB/' \
     -e 's/^maintenance_work_mem.*/maintenance_work_mem = 512MB/' -e 's/^max_wal_size.*/max_wal_size = 4GB/' \
