@@ -62,7 +62,9 @@ enum Bytes {
 
     /// memcmp of `n` bytes, where a pointer may be nil only if `n` is 0.
     @inline(__always) static func compare(_ a: UnsafeRawPointer?, _ b: UnsafeRawPointer?, _ n: Int) -> Int32 {
-        n == 0 ? 0 : memcmp(a, b, n)
+        guard n > 0 else { return 0 }
+        guard let a, let b else { preconditionFailure("memcmp of \(n) bytes without a pointer") }
+        return memcmp(a, b, n)
     }
 
     @inline(__always) static func equal(_ a: borrowing [UInt8], _ b: StaticString) -> Bool {
