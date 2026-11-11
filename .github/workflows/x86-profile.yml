@@ -1,4 +1,4 @@
-# Not for upstream: swift-iouring-akbashev (#112) with its state a value its loop owns (d6ccc88), against #112 at
+# Not for upstream: swift-iouring-akbashev (#112) with its state owned by its loop and no force unwraps (f4a0b30), against #112 at
 # 03d0113 and fsharp-kestrel-uring-delneg, on one runner: the server on CPU 0, Postgres on CPU 1, mload on CPUs 2-3, all in one
 # network namespace. CPU per request (user, sys), system calls and io_uring operations per request, packets per request,
 # p95/p99, a perf profile. Two jobs, rotating order.

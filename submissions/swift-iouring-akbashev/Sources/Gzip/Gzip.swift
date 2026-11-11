@@ -135,11 +135,12 @@ public struct Gzip: ~Copyable, ~Sendable {
         for (path, usable) in [(CRCPath.carryless, carryless), (CRCPath.carryless512, wide)] where usable {
             var agree = true
             sample.withUnsafeBufferPointer { p in
+                guard let base = p.baseAddress else { return }
                 for n in [128, 144, 256, 272, 1000, 4103] {
                     crcPath = .tables
-                    let tables = crc32(p.baseAddress!, n)
+                    let tables = crc32(base, n)
                     crcPath = path
-                    agree = agree && crc32(p.baseAddress!, n) == tables
+                    agree = agree && crc32(base, n) == tables
                 }
             }
             crcPath = agree ? path : .tables
@@ -179,9 +180,11 @@ public struct Gzip: ~Copyable, ~Sendable {
     /// `input` as a gzip member into `out`, which has room for `bound(input.count)` bytes; returns how many it wrote.
     public mutating func compress(_ input: UnsafeRawBufferPointer, into out: UnsafeMutableRawBufferPointer) -> Int {
         let n = input.count
-        precondition(n > 0 && out.count >= Self.bound(n))
-        let src = input.baseAddress!.assumingMemoryBound(to: UInt8.self)
-        let dst = out.baseAddress!.assumingMemoryBound(to: UInt8.self)
+        guard n > 0, out.count >= Self.bound(n), let inputBytes = input.baseAddress, let outputBytes = out.baseAddress else {
+            preconditionFailure("compress needs bytes, and room for bound(input.count)")
+        }
+        let src = inputBytes.assumingMemoryBound(to: UInt8.self)
+        let dst = outputBytes.assumingMemoryBound(to: UInt8.self)
         // ID1 ID2, CM = deflate, no flags, no mtime, no extra flags, OS = Unix; then the block header.
         var w = BitWriter(dst)
         w.uint32LE(0x0008_8B1F)
@@ -368,7 +371,9 @@ public struct Gzip: ~Copyable, ~Sendable {
             }
             switch symbol {
             case 0..<16: lengths.append(UInt8(symbol))
-            case 16: lengths += repeatElement(lengths.last!, count: 3 + r.take(2))
+            case 16:
+                guard let previous = lengths.last else { preconditionFailure("a repeat with no length before it") }
+                lengths += repeatElement(previous, count: 3 + r.take(2))
             case 17: lengths += repeatElement(0, count: 3 + r.take(3))
             case 18: lengths += repeatElement(0, count: 11 + r.take(7))
             default: preconditionFailure("not a code in the header")

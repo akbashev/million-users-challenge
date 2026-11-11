@@ -77,7 +77,10 @@ enum SHA256 {
         #if arch(x86_64)
         if extensions {
             data.withUnsafeBytes { raw in
-                withUnsafeMutableBytes(of: &state) { SHAExtensions.compress($0.baseAddress!.assumingMemoryBound(to: UInt32.self), raw.baseAddress!, blocks: blocks) }
+                guard let blockBytes = raw.baseAddress else { return }
+                withUnsafeMutablePointer(to: &state) { s in
+                    SHAExtensions.compress(UnsafeMutableRawPointer(s).assumingMemoryBound(to: UInt32.self), blockBytes, blocks: blocks)
+                }
             }
             return
         }
