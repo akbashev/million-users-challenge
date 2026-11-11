@@ -24,12 +24,14 @@ jobs:
         with: { go-version-file: bench/mload/go.mod, cache: false }
       - name: machine
         run: lscpu | grep -E 'Model name|^CPU\(s\)|Thread' | cut -c1-200; uname -r; free -m
-      - name: rig (namespace, Postgres 18, seed)
-        run: sudo bash profile/setup.sh
+      - name: packages (network)
+        run: sudo bash profile/packages.sh
       - name: mload
-        run: (cd bench/mload && go build -o mload .) && sudo cp bench/mload/mload /opt/bench/mload
-      - name: entries
+        run: (cd bench/mload && go build -o mload .) && sudo mkdir -p /opt/bench && sudo cp bench/mload/mload /opt/bench/mload
+      - name: entries (network)
         run: sudo bash profile/entries.sh swift-iouring-akbashev swift-iouring-akbashev-old fsharp-kestrel-uring-delneg
+      - name: rig (namespace, Postgres 18, seed)
+        run: sudo bash profile/rig.sh
       - name: tests (#112 sending through the ring)
         run: sudo bash profile/test.sh swift-iouring-akbashev
       - name: runs (100,000 users, -gzip, think 0.7)
