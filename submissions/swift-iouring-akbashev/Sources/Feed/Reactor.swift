@@ -708,9 +708,10 @@ extension Reactor {
     ///
     /// The state is plain fields, not an enum: `fd < 0` is a free slot (or a dropped one whose send is still in flight,
     /// see `dropConn`), and the flags combine freely, so a few combinations that can't happen can still be written. An
-    /// enum per slot (free, open, closing) would make them unrepresentable, but slots are what every request touches,
-    /// and an enum with payloads there may cost a tag check and copies on each access. Not measured: the optimizer may
-    /// lay it out and compile it just as cheaply, which is worth checking before choosing.
+    /// enum per slot (free, open, closing) would make them unrepresentable, but slots are what every request touches.
+    /// Checked with Swift 6.4: reading the case costs nothing, but each update moves the whole slot out of the enum and
+    /// back (a payload can't be mutated in place), and those copies stay in the optimized code: receiving goes from 50
+    /// to 124 instructions, sending from 145 to 196. About 0.5% of a request, so the fields stay.
     struct ClientSlot: ~Copyable {
         var fd: Int32
         var epoch: UInt32 = 0
